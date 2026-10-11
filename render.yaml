@@ -1,10 +1,11 @@
 services:
-  - type: worker
-    name: usdt-p2p-az-bot
+  - type: web
+    name: usdt-p2p-az
     runtime: python
+    plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: python main.py
-    autoDeploy: true
+    healthCheckPath: /health
     envVars:
       - key: BOT_TOKEN
         sync: false
