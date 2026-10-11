@@ -3,7 +3,7 @@ services:
     name: usdt-p2p-az-bot
     runtime: python
     buildCommand: pip install -r requirements.txt
-    startCommand: python app/main.py
+    startCommand: python main.py
     autoDeploy: true
     envVars:
       - key: BOT_TOKEN
