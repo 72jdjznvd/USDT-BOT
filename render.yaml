@@ -1,0 +1,22 @@
+services:
+  - type: worker
+    name: usdt-p2p-az-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python app/main.py
+    autoDeploy: true
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: BUY_RATE
+        value: "1.70"
+      - key: SELL_RATE
+        value: "1.69"
+      - key: PAYMENT_MINUTES
+        value: "3"
+      - key: BANK_DETAILS
+        sync: false
+      - key: SELL_TRC20_ADDRESS
+        sync: false
+      - key: OPERATOR_CHAT_ID
+        sync: false
