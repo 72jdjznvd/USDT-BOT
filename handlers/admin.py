@@ -1,340 +1,334 @@
 import os
-from html import escape
+import logging
+from decimal import Decimal, InvalidOperation
 
 from aiogram import Router, F
 from aiogram.filters import Command
 from aiogram.types import (
-Message,
-CallbackQuery,
-InlineKeyboardMarkup,
-InlineKeyboardButton,
+    Message,
+    CallbackQuery,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
 )
 
 from database import (
-list_orders,
-get_order,
-admin_decide,
+    list_orders,
+    get_order,
+    admin_decide,
 )
 
 router = Router()
+logger = logging.getLogger(__name__)
 
 ADMIN_IDS = {
-int(value.strip())
-for value in os.getenv("ADMIN_IDS", "").split(",")
-if value.strip().isdigit()
+    int(value.strip())
+    for value in os.getenv("ADMIN_IDS", "").split(",")
+    if value.strip().isdigit()
 }
 
-def is_admin(user_id: int) -> bool:
-return user_id in ADMIN_IDS
 
-def order_keyboard(order_ref: str) -> InlineKeyboardMarkup:
-return InlineKeyboardMarkup(
-inline_keyboard=[
-[
-InlineKeyboardButton(
-text="✅ Təsdiqlə",
-callback_data=f"admin:approve:{order_ref}",
-),
-InlineKeyboardButton(
-text="❌ Rədd et",
-callback_data=f"admin:reject:{order_ref}",
-),
-],
-[
-InlineKeyboardButton(
-text="🔄 Yenilə",
-callback_data=f"admin:view:{order_ref}",
-)
-],
-]
-)
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
 
 def format_order(order: dict) -> str:
-username = order.get("username")
-username_text = f"@{username}" if username else "yoxdur"
+    username = order.get("username") or "Yoxdur"
+    first_name = order.get("first_name") or ""
+    last_name = order.get("last_name") or ""
+    full_name = f"{first_name} {last_name}".strip() or "Ad yoxdur"
 
-first_name = order.get("first_name") or ""
-last_name = order.get("last_name") or ""
-full_name = escape(f"{first_name} {last_name}".strip() or "—")
+    return (
+        f"🧾 <b>Sifariş:</b> <code>{order.get('order_ref', '-')}</code>\n"
+        f"👤 <b>İstifadəçi:</b> {full_name}\n"
+        f"🔗 <b>Username:</b> @{username}\n"
+        f"🆔 <b>Telegram ID:</b> <code>{order.get('telegram_id', '-')}</code>\n"
+        f"📌 <b>Növ:</b> {order.get('kind', '-')}\n"
+        f"💰 <b>USDT:</b> {order.get('amount', '-')}\n"
+        f"💱 <b>Məzənnə:</b> {order.get('rate', '-')}\n"
+        f"💵 <b>AZN:</b> {order.get('total', '-')}\n"
+        f"🏦 <b>Ödəniş:</b> {order.get('payment_method') or '-'}\n"
+        f"📍 <b>Status:</b> {order.get('status', '-')}\n"
+        f"🔎 <b>TXID:</b> <code>{order.get('txid') or '-'}</code>\n"
+        f"📝 <b>İmtina səbəbi:</b> {order.get('rejection_reason') or '-'}"
+    )
 
-kind = order.get("kind", "—")
-kind_text = "USDT alış" if kind == "buy" else "USDT satış"
 
-return (
-    f"🧾 <b>Sifariş:</b> <code>{escape(str(order.get('order_ref', '—')))}</code>\n"
-    f"👤 <b>Müştəri:</b> {full_name}\n"
-    f"🔗 <b>Username:</b> {escape(username_text)}\n"
-    f"🆔 <b>Telegram ID:</b> <code>{order.get('telegram_id', '—')}</code>\n"
-    f"📌 <b>Növ:</b> {kind_text}\n"
-    f"💵 <b>Məbləğ:</b> {escape(str(order.get('amount', '—')))} USDT\n"
-    f"💱 <b>Məzənnə:</b> {escape(str(order.get('rate', '—')))} AZN\n"
-    f"💰 <b>AZN:</b> {escape(str(order.get('total', '—')))}\n"
-    f"🏦 <b>Ödəniş üsulu:</b> {escape(str(order.get('payment_method', '—')))}\n"
-    f"📍 <b>Status:</b> {escape(str(order.get('status', '—')))}\n"
-    f"🧾 <b>TXID:</b> <code>{escape(str(order.get('txid') or 'yoxdur'))}</code>"
-)
+def order_keyboard(order: dict) -> InlineKeyboardMarkup:
+    order_ref = order["order_ref"]
+
+    buttons = [
+        [
+            InlineKeyboardButton(
+                text="🔄 Yenilə",
+                callback_data=f"admin:view:{order_ref}",
+            )
+        ]
+    ]
+
+    if order.get("status") == "review":
+        buttons.append([
+            InlineKeyboardButton(
+                text="✅ Təsdiqlə",
+                callback_data=f"admin:approve:{order_ref}",
+            ),
+            InlineKeyboardButton(
+                text="❌ İmtina et",
+                callback_data=f"admin:reject:{order_ref}",
+            ),
+        ])
+
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
 
 @router.message(Command("admin"))
 async def admin_panel(message: Message):
-if not message.from_user or not is_admin(message.from_user.id):
-await message.answer("⛔ Bu bölmə yalnız administrator üçündür.")
-return
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ Bu bölmə yalnız administrator üçündür.")
+        return
 
-keyboard = InlineKeyboardMarkup(
-    inline_keyboard=[
-        [
-            InlineKeyboardButton(
-                text="🕒 Yoxlanılmamış sifarişlər",
-                callback_data="admin:list:review",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                text="📋 Son sifarişlər",
-                callback_data="admin:list:all",
-            )
-        ],
-    ]
-)
+    orders = await list_orders(limit=20)
 
-await message.answer(
-    "🛠 <b>USDT P2P AZ — Admin paneli</b>\n\n"
-    "Sifarişləri seçmək üçün aşağıdakı düymələrdən istifadə et.",
-    reply_markup=keyboard,
-    parse_mode="HTML",
-)
+    if not orders:
+        await message.answer("Hələ sifariş yoxdur.")
+        return
 
-@router.callback_query(F.data.startswith("admin:list:"))
-async def list_orders_handler(callback: CallbackQuery):
-if not is_admin(callback.from_user.id):
-await callback.answer("İcazə yoxdur.", show_alert=True)
-return
-
-selection = callback.data.rsplit(":", 1)[-1]
-
-try:
-    if selection == "review":
-        orders = await list_orders(status="review", limit=20)
-    else:
-        orders = await list_orders(limit=20)
-except Exception:
-    await callback.answer("Sifarişlər yüklənmədi.", show_alert=True)
-    return
-
-await callback.answer()
-
-if not orders:
-    if callback.message:
-        await callback.message.answer("📭 Sifariş tapılmadı.")
-    return
-
-if callback.message:
-    await callback.message.answer(
-        f"📋 Tapılan sifarişlər: {len(orders)}"
+    await message.answer(
+        f"🛠 <b>Administrator paneli</b>\n"
+        f"Son {len(orders)} sifariş göstərilir."
     )
 
-for order in orders:
-    order_ref = order.get("order_ref")
-    if not order_ref:
-        continue
+    for order in orders:
+        try:
+            await message.answer(
+                format_order(order),
+                reply_markup=order_keyboard(order),
+            )
+        except Exception:
+            logger.exception("Sifariş göstərilmədi: %s", order.get("order_ref"))
 
-    text = format_order(order)
-    keyboard = order_keyboard(order_ref) if order.get("status") == "review" else None
 
-    if callback.message:
-        await callback.message.answer(
-            text,
-            reply_markup=keyboard,
-            parse_mode="HTML",
+@router.message(Command("review"))
+async def review_orders(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ İcazən yoxdur.")
+        return
+
+    orders = await list_orders(status="review", limit=30)
+
+    if not orders:
+        await message.answer("Yoxlanılma gözləyən sifariş yoxdur.")
+        return
+
+    await message.answer(
+        f"🔎 <b>Yoxlanılmalı sifarişlər:</b> {len(orders)}"
+    )
+
+    for order in orders:
+        await message.answer(
+            format_order(order),
+            reply_markup=order_keyboard(order),
         )
 
-        # Qəbz foto və ya sənəd kimi saxlanılıbsa, onu da göstər.
-        receipt_file_id = order.get("receipt_file_id")
-        if receipt_file_id and order.get("kind") == "buy":
+        # Qəbz varsa, onun foto/sənəd növünə uyğun göndər.
+        file_id = order.get("receipt_file_id")
+        file_type = order.get("receipt_type") or "document"
+
+        if order.get("kind") == "buy" and file_id:
             try:
-                await callback.message.bot.send_document(
-                    callback.from_user.id,
-                    receipt_file_id,
-                    caption=f"Qəbz: {order_ref}",
-                )
+                if file_type == "photo":
+                    await message.bot.send_photo(
+                        chat_id=message.chat.id,
+                        photo=file_id,
+                        caption=f"📎 Qəbz: {order['order_ref']}",
+                    )
+                else:
+                    await message.bot.send_document(
+                        chat_id=message.chat.id,
+                        document=file_id,
+                        caption=f"📎 Qəbz: {order['order_ref']}",
+                    )
             except Exception:
-                pass
+                logger.exception(
+                    "Qəbz göstərilmədi: %s",
+                    order.get("order_ref"),
+                )
+                await message.answer(
+                    "⚠️ Qəbz göstərilə bilmədi. "
+                    "İlkin bildirişdəki qəbzi yoxla."
+                )
+
 
 @router.callback_query(F.data.startswith("admin:view:"))
-async def view_order_handler(callback: CallbackQuery):
-if not is_admin(callback.from_user.id):
-await callback.answer("İcazə yoxdur.", show_alert=True)
-return
+async def view_order(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("İcazən yoxdur.", show_alert=True)
+        return
 
-order_ref = callback.data.split(":", 2)[2]
-
-try:
+    order_ref = callback.data.split(":", 2)[2]
     order = await get_order(order_ref)
-except Exception:
-    order = None
 
-if not order:
-    await callback.answer("Sifariş tapılmadı.", show_alert=True)
-    return
+    if not order:
+        await callback.answer("Sifariş tapılmadı.", show_alert=True)
+        return
 
-keyboard = order_keyboard(order_ref) if order.get("status") == "review" else None
+    await callback.answer("Sifariş yeniləndi.")
 
-await callback.answer()
-
-if callback.message:
-    await callback.message.answer(
-        format_order(order),
-        reply_markup=keyboard,
-        parse_mode="HTML",
-    )
-
-    receipt_file_id = order.get("receipt_file_id")
-    if receipt_file_id and order.get("kind") == "buy":
-        await callback.message.bot.send_document(
-            callback.from_user.id,
-            receipt_file_id,
-            caption=f"Qəbz: {order_ref}",
+    if callback.message:
+        await callback.message.edit_text(
+            format_order(order),
+            reply_markup=order_keyboard(order),
         )
+
 
 @router.callback_query(F.data.startswith("admin:approve:"))
 async def approve_order_handler(callback: CallbackQuery):
-if not is_admin(callback.from_user.id):
-await callback.answer("İcazə yoxdur.", show_alert=True)
-return
+    if not is_admin(callback.from_user.id):
+        await callback.answer("İcazən yoxdur.", show_alert=True)
+        return
 
-order_ref = callback.data.split(":", 2)[2]
-
-try:
+    order_ref = callback.data.split(":", 2)[2]
     order = await get_order(order_ref)
-    if not order or order.get("status") != "review":
+
+    if not order:
+        await callback.answer("Sifariş tapılmadı.", show_alert=True)
+        return
+
+    if order.get("status") != "review":
         await callback.answer(
-            "Sifariş tapılmadı və ya artıq işlənib.",
+            "Bu sifariş artıq yoxlanılıb və ya statusu dəyişib.",
             show_alert=True,
         )
         return
 
     if order.get("kind") == "sell":
         await callback.answer(
-            "Əvvəl TXID-ni blokçeyndə yoxla. Sonra qərar ver.",
+            "Satış sifarişini təsdiqləməzdən əvvəl TXID-ni blokçeyndə yoxla.",
             show_alert=True,
         )
+        return
+
+    if order.get("kind") != "buy":
+        await callback.answer("Naməlum sifariş növü.", show_alert=True)
         return
 
     success = await admin_decide(
         order_ref=order_ref,
         admin_id=callback.from_user.id,
         decision="approve",
-        reason=None,
-    )
-except Exception:
-    success = False
-    order = None
-
-if not success:
-    await callback.answer(
-        "Sifariş yenilənmədi. Verilənlər bazasını yoxla.",
-        show_alert=True,
-    )
-    return
-
-await callback.answer("Sifariş təsdiqləndi.")
-
-if callback.message:
-    await callback.message.answer(
-        f"✅ {order_ref} sifarişinin qəbzi administrator tərəfindən təsdiqləndi.\n"
-        "Bu, USDT-nin müştəriyə göndərildiyini bildirmir."
     )
 
-if order:
+    if not success:
+        await callback.answer(
+            "Status dəyişdirilmədi. Sifarişi yenilə.",
+            show_alert=True,
+        )
+        return
+
+    await callback.answer("Sifariş təsdiqləndi.")
+
+    if callback.message:
+        await callback.message.edit_text(
+            format_order(await get_order(order_ref))
+        )
+
     try:
         await callback.bot.send_message(
-            int(order["telegram_id"]),
-            f"✅ {order_ref} sifarişinizin ödənişi yoxlanıldı.\n"
-            "USDT köçürməsinin tamamlanmasını gözləyin.",
+            chat_id=order["telegram_id"],
+            text=(
+                "✅ <b>Ödəniş qəbzin təsdiqləndi.</b>\n\n"
+                f"Sifariş: <code>{order_ref}</code>\n"
+                "Bu bildiriş USDT-nin göndərildiyini təsdiqləmir. "
+                "Köçürmə tamamlandıqdan sonra ayrıca TXID və ya "
+                "təsdiq təqdim edilməlidir."
+            ),
         )
     except Exception:
-        pass
+        logger.exception("İstifadəçiyə bildiriş göndərilmədi.")
+
 
 @router.callback_query(F.data.startswith("admin:reject:"))
 async def reject_order_handler(callback: CallbackQuery):
-if not is_admin(callback.from_user.id):
-await callback.answer("İcazə yoxdur.", show_alert=True)
-return
+    if not is_admin(callback.from_user.id):
+        await callback.answer("İcazən yoxdur.", show_alert=True)
+        return
 
-order_ref = callback.data.split(":", 2)[2]
-
-try:
+    order_ref = callback.data.split(":", 2)[2]
     order = await get_order(order_ref)
-except Exception:
-    order = None
 
-if not order or order.get("status") != "review":
-    await callback.answer(
-        "Sifariş tapılmadı və ya artıq işlənib.",
-        show_alert=True,
-    )
-    return
+    if not order:
+        await callback.answer("Sifariş tapılmadı.", show_alert=True)
+        return
 
-keyboard = InlineKeyboardMarkup(
-    inline_keyboard=[
-        [
-            InlineKeyboardButton(
-                text="❌ Qəbz/TXID uyğun deyil",
-                callback_data=f"admin:reject_reason:{order_ref}:invalid",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                text="❌ Ödəniş tapılmadı",
-                callback_data=f"admin:reject_reason:{order_ref}:missing",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                text="⬅️ Geri",
-                callback_data=f"admin:view:{order_ref}",
-            )
-        ],
-    ]
-)
+    if order.get("status") != "review":
+        await callback.answer(
+            "Sifariş artıq yoxlanılıb və ya statusu dəyişib.",
+            show_alert=True,
+        )
+        return
 
-await callback.answer()
-
-if callback.message:
-    await callback.message.answer(
-        f"❌ <b>{escape(order_ref)}</b> sifarişi üçün rədd səbəbini seç:",
-        reply_markup=keyboard,
-        parse_mode="HTML",
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Qəbz aydın deyil",
+                    callback_data=f"admin:reason:{order_ref}:receipt",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Ödəniş təsdiqlənməyib",
+                    callback_data=f"admin:reason:{order_ref}:unpaid",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Yanlış məlumat",
+                    callback_data=f"admin:reason:{order_ref}:invalid",
+                )
+            ],
+        ]
     )
 
-@router.callback_query(F.data.startswith("admin:reject_reason:"))
+    await callback.answer()
+
+    if callback.message:
+        await callback.message.answer(
+            f"❌ <b>{order_ref}</b> üçün imtina səbəbini seç:",
+            reply_markup=keyboard,
+        )
+
+
+@router.callback_query(F.data.startswith("admin:reason:"))
 async def reject_reason_handler(callback: CallbackQuery):
-if not is_admin(callback.from_user.id):
-await callback.answer("İcazə yoxdur.", show_alert=True)
-return
+    if not is_admin(callback.from_user.id):
+        await callback.answer("İcazən yoxdur.", show_alert=True)
+        return
 
-parts = callback.data.split(":")
-if len(parts) != 4:
-    await callback.answer("Yanlış seçim.", show_alert=True)
-    return
+    parts = callback.data.split(":")
 
-order_ref, reason_code = parts[2], parts[3]
+    if len(parts) != 4:
+        await callback.answer("Yanlış sorğu.", show_alert=True)
+        return
 
-reasons = {
-    "invalid": "Qəbz və ya TXID uyğun deyil.",
-    "missing": "Ödəniş hesabda aşkarlanmadı.",
-}
-reason = reasons.get(reason_code)
+    _, _, order_ref, reason_code = parts
 
-if not reason:
-    await callback.answer("Yanlış səbəb.", show_alert=True)
-    return
+    reasons = {
+        "receipt": "Qəbz aydın deyil",
+        "unpaid": "Ödəniş təsdiqlənməyib",
+        "invalid": "Yanlış məlumat",
+    }
 
-try:
+    reason = reasons.get(reason_code)
+
+    if reason is None:
+        await callback.answer("İmtina səbəbi tapılmadı.", show_alert=True)
+        return
+
     order = await get_order(order_ref)
+
     if not order or order.get("status") != "review":
         await callback.answer(
-            "Sifariş artıq işlənib.",
+            "Sifariş tapılmadı və ya artıq yoxlanılıb.",
             show_alert=True,
         )
         return
@@ -345,28 +339,32 @@ try:
         decision="reject",
         reason=reason,
     )
-except Exception:
-    success = False
-    order = None
 
-if not success:
-    await callback.answer("Sifariş yenilənmədi.", show_alert=True)
-    return
+    if not success:
+        await callback.answer(
+            "Sifarişin statusu dəyişdirilmədi.",
+            show_alert=True,
+        )
+        return
 
-await callback.answer("Sifariş rədd edildi.")
+    await callback.answer("Sifariş rədd edildi.")
 
-if callback.message:
-    await callback.message.answer(
-        f"❌ {order_ref} sifarişi rədd edildi.\nSəbəb: {reason}"
-    )
+    if callback.message:
+        await callback.message.edit_text(
+            f"❌ <b>Sifariş rədd edildi</b>\n"
+            f"Sifariş: <code>{order_ref}</code>\n"
+            f"Səbəb: {reason}"
+        )
 
-if order:
     try:
         await callback.bot.send_message(
-            int(order["telegram_id"]),
-            f"❌ Sifarişiniz rədd edildi.\n"
-            f"Sifariş: {order_ref}\n"
-            f"Səbəb: {reason}",
+            chat_id=order["telegram_id"],
+            text=(
+                "❌ <b>Sifariş qəbul edilmədi.</b>\n\n"
+                f"Sifariş: <code>{order_ref}</code>\n"
+                f"Səbəb: {reason}\n\n"
+                "Məlumatları yoxlayıb administratorla əlaqə saxla."
+            ),
         )
     except Exception:
-        pass
+        logger.exception("İstifadəçiyə imtina bildirişi göndərilmədi.")
