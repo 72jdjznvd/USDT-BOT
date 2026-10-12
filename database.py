@@ -1,389 +1,314 @@
-
 import os
-import asyncpg
-import logging
+import sqlite3
+import asyncio
+from pathlib import Path
 from datetime import datetime, timezone
-from decimal import Decimal
 
-logger = logging.getLogger(__name__)
+BASE_DIR = Path(file).resolve().parent
+DB_PATH = Path(os.getenv("DATABASE_PATH", str(BASE_DIR / "p2p.db")))
 
-_pool = None
+_db = None
+_lock = asyncio.Lock()
 
+def now():
+return datetime.now(timezone.utc).isoformat()
 
 async def connect_db():
-    global _pool
+global _db
 
-    database_url = os.getenv("DATABASE_URL", "").strip()
-    if not database_url:
-        raise RuntimeError("DATABASE_URL Render Environment-də yoxdur.")
+async with _lock:
+    if _db is not None:
+        return
 
-    if _pool is not None:
-        return _pool
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _db = sqlite3.connect(str(DB_PATH), check_same_thread=False)
+    _db.row_factory = sqlite3.Row
+    _db.execute("PRAGMA foreign_keys = ON")
 
-    _pool = await asyncpg.create_pool(
-        dsn=database_url,
-        min_size=1,
-        max_size=10,
-        command_timeout=30,
-        ssl="require" if "localhost" not in database_url else None,
-    )
+    _db.executescript("""
+    CREATE TABLE IF NOT EXISTS users (
+        telegram_id INTEGER PRIMARY KEY,
+        username TEXT,
+        first_name TEXT,
+        last_name TEXT,
+        language TEXT DEFAULT 'az',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
 
-    async with _pool.acquire() as conn:
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                telegram_id BIGINT PRIMARY KEY,
-                username TEXT,
-                first_name TEXT,
-                last_name TEXT,
-                language TEXT NOT NULL DEFAULT 'az',
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            );
+    CREATE TABLE IF NOT EXISTS orders (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        order_ref TEXT UNIQUE NOT NULL,
+        telegram_id INTEGER NOT NULL,
+        kind TEXT NOT NULL,
+        amount TEXT NOT NULL,
+        rate TEXT NOT NULL,
+        total TEXT NOT NULL,
+        currency TEXT DEFAULT 'AZN',
+        status TEXT DEFAULT 'pending',
+        payment_method TEXT,
+        receipt_file_id TEXT,
+        txid TEXT UNIQUE,
+        bank_name TEXT,
+        customer_note TEXT,
+        rejection_reason TEXT,
+        admin_id INTEGER,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        expires_at TEXT,
+        completed_at TEXT,
+        FOREIGN KEY (telegram_id) REFERENCES users(telegram_id)
+    );
 
-            CREATE TABLE IF NOT EXISTS orders (
-                id BIGSERIAL PRIMARY KEY,
-                order_ref TEXT UNIQUE NOT NULL,
-                telegram_id BIGINT NOT NULL REFERENCES users(telegram_id),
-                kind TEXT NOT NULL CHECK (kind IN ('buy', 'sell')),
-                amount NUMERIC(24, 6) NOT NULL CHECK (amount > 0),
-                rate NUMERIC(18, 6) NOT NULL CHECK (rate > 0),
-                total NUMERIC(24, 2) NOT NULL CHECK (total > 0),
-                currency TEXT NOT NULL DEFAULT 'AZN',
-                status TEXT NOT NULL DEFAULT 'pending',
-                payment_method TEXT,
-                receipt_file_id TEXT,
-                txid TEXT UNIQUE,
-                bank_name TEXT,
-                customer_note TEXT,
-                rejection_reason TEXT,
-                admin_id BIGINT,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                expires_at TIMESTAMPTZ,
-                completed_at TIMESTAMPTZ
-            );
+    CREATE TABLE IF NOT EXISTS audit_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        order_ref TEXT,
+        admin_id INTEGER,
+        action TEXT NOT NULL,
+        details TEXT,
+        created_at TEXT NOT NULL
+    );
 
-            CREATE INDEX IF NOT EXISTS idx_orders_user
-                ON orders(telegram_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_orders_user
+    ON orders(telegram_id);
 
-            CREATE INDEX IF NOT EXISTS idx_orders_status
-                ON orders(status, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_orders_status
+    ON orders(status);
+    """)
 
-            CREATE TABLE IF NOT EXISTS audit_log (
-                id BIGSERIAL PRIMARY KEY,
-                admin_id BIGINT,
-                order_ref TEXT,
-                action TEXT NOT NULL,
-                details TEXT,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            );
-        """)
-
-    logger.info("PostgreSQL bağlantısı hazır.")
-    return _pool
-
+    _db.commit()
 
 async def close_db():
-    global _pool
+global _db
 
-    if _pool is not None:
-        await _pool.close()
-        _pool = None
+async with _lock:
+    if _db is not None:
+        _db.close()
+        _db = None
 
-
-def get_pool():
-    if _pool is None:
-        raise RuntimeError("Əvvəl connect_db() çağırılmalıdır.")
-    return _pool
-
+def _connection():
+if _db is None:
+raise RuntimeError("Database is not connected. Call connect_db() first.")
+return _db
 
 async def save_user(
-    telegram_id: int,
-    username: str | None,
-    first_name: str | None,
-    last_name: str | None,
-    language: str = "az",
+telegram_id,
+username=None,
+first_name=None,
+last_name=None,
+language="az",
 ):
-    pool = get_pool()
+async with _lock:
+db = _connection()
+timestamp = now()
 
-    async with pool.acquire() as conn:
-        await conn.execute("""
-            INSERT INTO users (
-                telegram_id, username, first_name,
-                last_name, language
-            )
-            VALUES ($1, $2, $3, $4, $5)
-            ON CONFLICT (telegram_id) DO UPDATE SET
-                username = EXCLUDED.username,
-                first_name = EXCLUDED.first_name,
-                last_name = EXCLUDED.last_name,
-                language = EXCLUDED.language,
-                updated_at = NOW()
-        """, telegram_id, username, first_name, last_name, language)
-
-
-async def get_user(telegram_id: int):
-    pool = get_pool()
-
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT * FROM users WHERE telegram_id = $1",
-            telegram_id,
+    db.execute("""
+        INSERT INTO users (
+            telegram_id, username, first_name, last_name,
+            language, created_at, updated_at
         )
-        return dict(row) if row else None
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(telegram_id) DO UPDATE SET
+            username = excluded.username,
+            first_name = excluded.first_name,
+            last_name = excluded.last_name,
+            language = excluded.language,
+            updated_at = excluded.updated_at
+    """, (
+        telegram_id, username, first_name, last_name,
+        language, timestamp, timestamp
+    ))
+    db.commit()
 
+async def get_user(telegram_id):
+async with _lock:
+row = _connection().execute(
+"SELECT * FROM users WHERE telegram_id = ?",
+(telegram_id,),
+).fetchone()
+return dict(row) if row else None
 
 async def create_order(
-    order_ref: str,
-    telegram_id: int,
-    kind: str,
-    amount: Decimal,
-    rate: Decimal,
-    total: Decimal,
-    payment_method: str | None = None,
-    expires_at: datetime | None = None,
+order_ref,
+telegram_id,
+kind,
+amount,
+rate,
+total,
+currency="AZN",
+payment_method=None,
 ):
-    if kind not in ("buy", "sell"):
-        raise ValueError("Əməliyyat növü buy və ya sell olmalıdır.")
+async with _lock:
+db = _connection()
+timestamp = now()
 
-    if amount <= 0 or rate <= 0 or total <= 0:
-        raise ValueError("Məbləğ və məzənnə müsbət olmalıdır.")
+    db.execute("""
+        INSERT INTO orders (
+            order_ref, telegram_id, kind, amount, rate, total,
+            currency, status, payment_method, created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+    """, (
+        order_ref, telegram_id, kind, str(amount), str(rate),
+        str(total), currency, payment_method, timestamp, timestamp
+    ))
+    db.commit()
+    return order_ref
 
-    pool = get_pool()
+def _order_query(where_clause="", params=(), limit=None):
+sql = """
+SELECT o.*, u.username, u.first_name, u.last_name,
+u.language
+FROM orders o
+LEFT JOIN users u ON u.telegram_id = o.telegram_id
+"""
 
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            row = await conn.fetchrow("""
-                INSERT INTO orders (
-                    order_ref, telegram_id, kind,
-                    amount, rate, total,
-                    payment_method, expires_at
-                )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-                RETURNING *
-            """, order_ref, telegram_id, kind, amount, rate,
-                total, payment_method, expires_at)
+if where_clause:
+    sql += " WHERE " + where_clause
 
-            return dict(row)
+sql += " ORDER BY o.id DESC"
 
+if limit is not None:
+    sql += " LIMIT ?"
+    params = tuple(params) + (int(limit),)
 
-async def get_order(order_ref: str):
-    pool = get_pool()
+rows = _connection().execute(sql, params).fetchall()
+return [dict(row) for row in rows]
 
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow("""
-            SELECT o.*, u.username, u.first_name, u.last_name
-            FROM orders o
-            JOIN users u ON u.telegram_id = o.telegram_id
-            WHERE o.order_ref = $1
-        """, order_ref)
+async def get_order(order_ref):
+async with _lock:
+rows = _order_query("o.order_ref = ?", (order_ref,), limit=1)
+return rows[0] if rows else None
 
-        return dict(row) if row else None
+async def list_orders(status=None, limit=20):
+async with _lock:
+if status:
+return _order_query("o.status = ?", (status,), limit)
+return _order_query(limit=limit)
 
+async def list_user_orders(telegram_id, limit=10):
+async with _lock:
+return _order_query(
+"o.telegram_id = ?",
+(telegram_id,),
+limit,
+)
 
-async def list_orders(status: str | None = None, limit: int = 20):
-    pool = get_pool()
-    limit = max(1, min(int(limit), 100))
+async def set_receipt(order_ref, file_id):
+async with _lock:
+db = _connection()
+cursor = db.execute("""
+UPDATE orders
+SET receipt_file_id = ?, status = 'review', updated_at = ?
+WHERE order_ref = ? AND kind = 'buy' AND status = 'pending'
+""", (file_id, now(), order_ref))
+db.commit()
+return cursor.rowcount == 1
 
-    async with pool.acquire() as conn:
-        if status:
-            rows = await conn.fetch("""
-                SELECT o.*, u.username, u.first_name, u.last_name
-                FROM orders o
-                JOIN users u ON u.telegram_id = o.telegram_id
-                WHERE o.status = $1
-                ORDER BY o.created_at DESC
-                LIMIT $2
-            """, status, limit)
-        else:
-            rows = await conn.fetch("""
-                SELECT o.*, u.username, u.first_name, u.last_name
-                FROM orders o
-                JOIN users u ON u.telegram_id = o.telegram_id
-                ORDER BY o.created_at DESC
-                LIMIT $1
-            """, limit)
+async def set_txid(order_ref, txid):
+txid = txid.strip()
 
-        return [dict(row) for row in rows]
+if not txid:
+    return False
 
+async with _lock:
+    db = _connection()
 
-async def list_user_orders(telegram_id: int, limit: int = 20):
-    pool = get_pool()
-    limit = max(1, min(int(limit), 100))
-
-    async with pool.acquire() as conn:
-        rows = await conn.fetch("""
-            SELECT * FROM orders
-            WHERE telegram_id = $1
-            ORDER BY created_at DESC
-            LIMIT $2
-        """, telegram_id, limit)
-
-        return [dict(row) for row in rows]
-
-
-async def set_receipt(order_ref: str, file_id: str):
-    pool = get_pool()
-
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            row = await conn.fetchrow("""
-                UPDATE orders
-                SET receipt_file_id = $2,
-                    status = 'review',
-                    updated_at = NOW()
-                WHERE order_ref = $1
-                  AND kind = 'buy'
-                  AND status = 'pending'
-                  AND (expires_at IS NULL OR expires_at > NOW())
-                RETURNING *
-            """, order_ref, file_id)
-
-            return dict(row) if row else None
-
-
-async def set_txid(order_ref: str, txid: str):
-    txid = txid.strip()
-    if not txid or any(c.isspace() for c in txid):
-        raise ValueError("TXID formatı düzgün deyil.")
-
-    pool = get_pool()
-
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            row = await conn.fetchrow("""
-                UPDATE orders
-                SET txid = $2,
-                    status = 'review',
-                    updated_at = NOW()
-                WHERE order_ref = $1
-                  AND kind = 'sell'
-                  AND status = 'pending'
-                  AND (expires_at IS NULL OR expires_at > NOW())
-                RETURNING *
-            """, order_ref, txid)
-
-            return dict(row) if row else None
-
-
-async def set_bank(order_ref: str, bank_name: str):
-    pool = get_pool()
-
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow("""
+    # UNIQUE constraint prevents the same TXID being reused.
+    try:
+        cursor = db.execute("""
             UPDATE orders
-            SET bank_name = $2, updated_at = NOW()
-            WHERE order_ref = $1
-              AND kind = 'sell'
-              AND status = 'review'
-            RETURNING *
-        """, order_ref, bank_name)
+            SET txid = ?, status = 'review', updated_at = ?
+            WHERE order_ref = ? AND kind = 'sell' AND status = 'pending'
+        """, (txid, now(), order_ref))
+        db.commit()
+        return cursor.rowcount == 1
+    except sqlite3.IntegrityError:
+        db.rollback()
+        return False
 
-        return dict(row) if row else None
-
+async def set_bank(order_ref, bank_name):
+async with _lock:
+db = _connection()
+cursor = db.execute("""
+UPDATE orders
+SET bank_name = ?, payment_method = ?, updated_at = ?
+WHERE order_ref = ? AND kind = 'sell' AND status = 'review'
+""", (bank_name, bank_name, now(), order_ref))
+db.commit()
+return cursor.rowcount == 1
 
 async def admin_decide(
-    order_ref: str,
-    admin_id: int,
-    decision: str,
-    reason: str | None = None,
+order_ref,
+admin_id,
+decision,
+reason=None,
 ):
-    allowed = {
-        "approve": "approved",
-        "reject": "rejected",
-        "complete": "completed",
-    }
+if decision not in ("approve", "reject"):
+return False
 
-    if decision not in allowed:
-        raise ValueError("Naməlum admin qərarı.")
+new_status = "approved" if decision == "approve" else "rejected"
 
-    new_status = allowed[decision]
-    pool = get_pool()
+async with _lock:
+    db = _connection()
 
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            row = await conn.fetchrow("""
-                SELECT * FROM orders
-                WHERE order_ref = $1
-                FOR UPDATE
-            """, order_ref)
+    cursor = db.execute("""
+        UPDATE orders
+        SET status = ?, admin_id = ?, rejection_reason = ?,
+            updated_at = ?
+        WHERE order_ref = ? AND status = 'review'
+    """, (
+        new_status, admin_id, reason, now(), order_ref
+    ))
 
-            if not row:
-                return None
+    if cursor.rowcount != 1:
+        db.rollback()
+        return False
 
-            current = row["status"]
+    db.execute("""
+        INSERT INTO audit_log (
+            order_ref, admin_id, action, details, created_at
+        )
+        VALUES (?, ?, ?, ?, ?)
+    """, (
+        order_ref, admin_id, decision, reason, now()
+    ))
 
-            if decision in ("approve", "reject") and current != "review":
-                return None
-
-            if decision == "complete" and current != "approved":
-                return None
-
-            updated = await conn.fetchrow("""
-                UPDATE orders
-                SET status = $2,
-                    admin_id = $3,
-                    rejection_reason = $4,
-                    updated_at = NOW(),
-                    completed_at = CASE
-                        WHEN $2 = 'completed' THEN NOW()
-                        ELSE completed_at
-                    END
-                WHERE order_ref = $1
-                RETURNING *
-            """, order_ref, new_status, admin_id, reason)
-
-            await conn.execute("""
-                INSERT INTO audit_log (
-                    admin_id, order_ref, action, details
-                )
-                VALUES ($1, $2, $3, $4)
-            """, admin_id, order_ref, decision, reason)
-
-            return dict(updated)
-
+    db.commit()
+    return True
 
 async def dashboard_stats():
-    pool = get_pool()
+async with _lock:
+db = _connection()
 
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow("""
-            SELECT
-                COUNT(*) FILTER (
-                    WHERE status IN ('pending', 'review', 'approved')
-                ) AS active_orders,
-                COUNT(*) FILTER (
-                    WHERE status = 'completed'
-                      AND created_at >= CURRENT_DATE
-                ) AS completed_today,
-                COUNT(*) FILTER (
-                    WHERE created_at >= CURRENT_DATE
-                ) AS orders_today,
-                COALESCE(
-                    SUM(total) FILTER (
-                        WHERE status = 'completed'
-                          AND created_at >= CURRENT_DATE
-                    ), 0
-                ) AS turnover_today,
-                COUNT(DISTINCT telegram_id) AS customers
-            FROM orders
-        """)
+    total = db.execute(
+        "SELECT COUNT(*) FROM orders"
+    ).fetchone()[0]
 
-        return dict(row)
+    rows = db.execute("""
+        SELECT status, COUNT(*) AS count
+        FROM orders GROUP BY status
+    """).fetchall()
 
+    return {
+        "total": total,
+        "by_status": {
+            row["status"]: row["count"] for row in rows
+        },
+    }
 
 async def log_admin_action(
-    admin_id: int,
-    action: str,
-    order_ref: str | None = None,
-    details: str | None = None,
+admin_id,
+action,
+order_ref=None,
+details=None,
 ):
-    pool = get_pool()
-
-    async with pool.acquire() as conn:
-        await conn.execute("""
-            INSERT INTO audit_log (
-                admin_id, order_ref, action, details
-            )
-            VALUES ($1, $2, $3, $4)
-        """, admin_id, order_ref, action, details)
+async with _lock:
+db = _connection()
+db.execute("""
+INSERT INTO audit_log (
+order_ref, admin_id, action, details, created_at
+)
+VALUES (?, ?, ?, ?, ?)
+""", (order_ref, admin_id, action, details, now()))
+db.commit()
